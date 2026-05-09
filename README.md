@@ -3,7 +3,6 @@
 [![PyPI version](https://img.shields.io/pypi/v/valbloom.svg)](https://pypi.org/project/valbloom/)
 [![Python versions](https://img.shields.io/pypi/pyversions/valbloom.svg)](https://pypi.org/project/valbloom/)
 [![License: MIT](https://img.shields.io/pypi/l/valbloom.svg)](https://github.com/HATAKEkakshi/valbloom/blob/main/LICENSE)
-[![Downloads](https://img.shields.io/pypi/dm/valbloom.svg)](https://pypi.org/project/valbloom/)
 
 Fast, memory-efficient **Bloom Filters** backed by **Redis / Valkey** bitmaps.
 
