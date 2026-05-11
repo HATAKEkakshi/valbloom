@@ -68,6 +68,22 @@ await cbf.remove("session-xyz")
 await cbf.exists("session-xyz")   # False
 ```
 
+> [!WARNING]
+> **Duplicate-add behaviour:** A `CountingBloomFilter` does **not** de-duplicate.
+> Each `add()` increments the internal counters independently, so adding the
+> same item **N** times requires **N** matching `remove()` calls before
+> `exists()` returns `False`.
+>
+> ```python
+> await cbf.add("session-xyz")
+> await cbf.add("session-xyz")     # counter = 2
+> await cbf.remove("session-xyz")  # counter = 1
+> await cbf.exists("session-xyz")  # True — one add still outstanding
+> ```
+>
+> A `WARNING`-level log is emitted when a probable duplicate add is detected.
+> If you need strict single-add semantics, guard with `exists()` first.
+
 ### `ScalableBloomFilter` — Auto-Growing
 
 Automatically creates new filter slices when the current one fills up, so the false-positive rate stays bounded even as data grows beyond the initial capacity.
@@ -86,6 +102,12 @@ sbf = ScalableBloomFilter(
 for i in range(50_000):
     await sbf.add(f"user-{i}")
 ```
+
+> [!NOTE]
+> **TTL and auto-scaling:** When `set_ttl()` is called, the TTL is persisted
+> in the filter's metadata. New slices created by auto-scaling **automatically
+> inherit** the remaining TTL so all keys expire at roughly the same wall-clock
+> time. You do **not** need to call `set_ttl()` again after scaling occurs.
 
 ## Common API
 
@@ -117,6 +139,12 @@ All three filter types share these methods:
 | `union(other, dest_key)` | Merge filters with `BITOP OR` |
 | `intersection(other, dest_key)` | Intersect filters with `BITOP AND` |
 
+> [!IMPORTANT]
+> `union()` and `intersection()` require both filters to have **identical**
+> `capacity` and `error_rate`. Attempting to combine incompatible filters
+> raises `IncompatibleFilterError` with a descriptive message showing the
+> mismatched parameters.
+
 ## How It Works
 
 A Bloom filter uses a **bit array** of *m* bits and *k* independent hash functions. When adding an item, all *k* hash positions are set to 1. To check membership, all *k* positions are tested — if any is 0, the item is definitely not in the set.
@@ -139,6 +167,37 @@ ValBloom automatically computes optimal *m* and *k* from your desired `capacity`
 | Token blacklisting, email dedup, IP blocklisting | `BloomFilter` |
 | Session tracking, temporary bans (need removal) | `CountingBloomFilter` |
 | Unbounded growth, don't know final size | `ScalableBloomFilter` |
+
+## ⚠️ Production Warnings
+
+### Redis Persistence
+
+ValBloom stores all filter state in Redis. **If Redis restarts without persistence configured, the entire bloom filter disappears silently.** For production systems — especially healthcare, finance, or security workloads — this means previously blocked lookups will suddenly miss, requiring all items to be re-added.
+
+**Ensure Redis persistence (RDB or AOF) is configured:**
+
+```bash
+# redis.conf — enable AOF for durability
+appendonly yes
+appendfsync everysec
+
+# Or use RDB snapshots
+save 900 1
+save 300 10
+save 60 10000
+```
+
+> [!CAUTION]
+> Without persistence, a Redis restart causes **total filter loss**. In a
+> healthcare system this means previously de-duplicated lookups will hit
+> your primary database again, potentially causing duplicate processing
+> or degraded performance.
+
+### Key Expiration & TTL
+
+When using `set_ttl()`, both the bitmap (or hash) **and** the counter key receive the same TTL. For `ScalableBloomFilter`, newly created slices automatically inherit the remaining TTL from the parent metadata key.
+
+If you need filters to persist indefinitely, **do not** call `set_ttl()` — keys default to no expiration.
 
 ## Development
 

@@ -13,10 +13,6 @@ from valbloom import (
 )
 
 
-# ============================================================================
-# BloomFilter
-# ============================================================================
-
 class TestBloomFilter:
 
     @pytest.mark.asyncio
@@ -182,10 +178,6 @@ class TestBloomFilter:
         assert fp_rate < err * 3, f"FP rate {fp_rate:.4f} exceeds 3x target {err}"
 
 
-# ============================================================================
-# CountingBloomFilter
-# ============================================================================
-
 class TestCountingBloomFilter:
 
     @pytest.mark.asyncio
@@ -266,10 +258,28 @@ class TestCountingBloomFilter:
         with pytest.raises(ValueError):
             CountingBloomFilter(redis, "cbf:bad", capacity=-1)
 
+    @pytest.mark.asyncio
+    async def test_duplicate_add_emits_warning(self, redis, caplog):
+        """Adding the same item twice should emit a WARNING log."""
+        import logging
+        cbf = CountingBloomFilter(redis, "cbf:dup", capacity=1000)
+        with caplog.at_level(logging.WARNING, logger="valbloom.bloom"):
+            await cbf.add("session-xyz")
+            assert len(caplog.records) == 0  # first add — no warning
+            await cbf.add("session-xyz")
+            assert any("already exist" in r.message for r in caplog.records)
 
-# ============================================================================
-# ScalableBloomFilter
-# ============================================================================
+    @pytest.mark.asyncio
+    async def test_duplicate_add_remove_semantics(self, redis):
+        """add() twice → remove() once → exists() should still be True."""
+        cbf = CountingBloomFilter(redis, "cbf:sem", capacity=1000)
+        await cbf.add("item")
+        await cbf.add("item")
+        await cbf.remove("item")
+        assert await cbf.exists("item") is True
+        await cbf.remove("item")
+        assert await cbf.exists("item") is False
+
 
 class TestScalableBloomFilter:
 
@@ -344,3 +354,32 @@ class TestScalableBloomFilter:
             ScalableBloomFilter(redis, "sbf:bad", initial_capacity=100, growth_factor=0)
         with pytest.raises(ValueError):
             ScalableBloomFilter(redis, "sbf:bad", initial_capacity=100, ratio=1.5)
+
+    @pytest.mark.asyncio
+    async def test_ttl_inherited_on_scaling(self, redis):
+        """New slices created by auto-scaling should inherit the parent TTL."""
+        cap = 50
+        sbf = ScalableBloomFilter(redis, "sbf:ttl", initial_capacity=cap)
+        # Add items to fill first slice
+        await sbf.add_many([f"i-{i}" for i in range(cap)])
+        # Set TTL before scaling triggers
+        await sbf.set_ttl(600)
+        # This add should trigger a new slice
+        await sbf.add("overflow")
+        info = await sbf.info()
+        assert info["num_slices"] > 1
+        # Check that the new slice key has a TTL set
+        new_bf = sbf._slice_filter(info["num_slices"] - 1)
+        ttl = await redis.ttl(new_bf.key)
+        assert ttl > 0, "New slice should have inherited a TTL"
+
+
+class TestIncompatibleFilterError:
+
+    @pytest.mark.asyncio
+    async def test_error_includes_capacity_and_error_rate(self, redis):
+        """Error message should include capacity and error_rate for debugging."""
+        bf1 = BloomFilter(redis, "bf:e1", capacity=1000, error_rate=0.001)
+        bf2 = BloomFilter(redis, "bf:e2", capacity=5000, error_rate=0.01)
+        with pytest.raises(IncompatibleFilterError, match=r"capacity=.*error_rate="):
+            await bf1.union(bf2)

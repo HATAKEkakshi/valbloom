@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 from typing import Iterable, Dict, Any, List, Optional
 
@@ -7,6 +8,8 @@ from redis.asyncio import Redis
 
 from valbloom.helpers import optimal_m, optimal_k, hash_offsets, validate_params
 from valbloom.exceptions import IncompatibleFilterError
+
+logger = logging.getLogger(__name__)
 
 """
 ValBloom — Redis/Valkey-backed Bloom Filter implementations.
@@ -263,12 +266,12 @@ class BloomFilter:
         Merge this filter with another using bitwise OR (``BITOP OR``).
 
         The result contains all items from both filters. Both filters
-        must have identical ``m`` (bit-array size) and ``k`` (hash count),
-        which means they must have been created with the same ``capacity``
-        and ``error_rate``.
+        must have identical ``capacity`` and ``error_rate`` (which
+        determines matching ``m`` and ``k``).
 
         Args:
-            other: Another ``BloomFilter`` with matching ``m`` and ``k``.
+            other: Another ``BloomFilter`` with matching ``capacity``
+                and ``error_rate``.
             dest_key: Redis key for the merged result. Defaults to
                 ``self.key`` (in-place merge).
 
@@ -276,7 +279,8 @@ class BloomFilter:
             A new ``BloomFilter`` instance pointing at the destination key.
 
         Raises:
-            IncompatibleFilterError: If ``m`` or ``k`` differ between filters.
+            IncompatibleFilterError: If ``capacity`` or ``error_rate``
+                differ between the two filters.
         """
         self._assert_compatible(other)
         target = dest_key or self.key
@@ -292,17 +296,19 @@ class BloomFilter:
         Intersect this filter with another using bitwise AND (``BITOP AND``).
 
         The result approximates items that are in **both** filters.
-        Both filters must have identical ``m`` and ``k``.
+        Both filters must have identical ``capacity`` and ``error_rate``.
 
         Args:
-            other: Another ``BloomFilter`` with matching ``m`` and ``k``.
+            other: Another ``BloomFilter`` with matching ``capacity``
+                and ``error_rate``.
             dest_key: Redis key for the result. Defaults to ``self.key``.
 
         Returns:
             A new ``BloomFilter`` instance pointing at the destination key.
 
         Raises:
-            IncompatibleFilterError: If ``m`` or ``k`` differ between filters.
+            IncompatibleFilterError: If ``capacity`` or ``error_rate``
+                differ between the two filters.
         """
         self._assert_compatible(other)
         target = dest_key or self.key
@@ -314,11 +320,21 @@ class BloomFilter:
         return bf
 
     def _assert_compatible(self, other: "BloomFilter") -> None:
-        """Raise IncompatibleFilterError if filters have different m or k."""
+        """
+        Raise ``IncompatibleFilterError`` if the two filters were created
+        with different ``capacity`` or ``error_rate``.
+
+        The check compares the derived ``m`` (bit-array size) and ``k``
+        (hash count), which are deterministic functions of ``capacity``
+        and ``error_rate``.
+        """
         if self.m != other.m or self.k != other.k:
             raise IncompatibleFilterError(
-                f"Filters are not compatible: "
-                f"self(m={self.m}, k={self.k}) vs other(m={other.m}, k={other.k})"
+                f"Filters must have matching capacity and error_rate. "
+                f"Got capacity={self.capacity}/error_rate={self.error_rate} "
+                f"(m={self.m}, k={self.k}) vs "
+                f"capacity={other.capacity}/error_rate={other.error_rate} "
+                f"(m={other.m}, k={other.k})"
             )
 
     def __repr__(self) -> str:
@@ -378,11 +394,48 @@ class CountingBloomFilter:
         """
         Add an item by incrementing its ``k`` counter buckets by 1.
 
+        .. warning:: Duplicate-add behaviour
+
+            Adding the same item **N** times requires **N** corresponding
+            ``remove()`` calls before ``exists()`` returns ``False``.
+            A ``CountingBloomFilter`` does **not** de-duplicate; each
+            ``add()`` is an independent counter increment.
+
+            Example::
+
+                await cbf.add("session-xyz")
+                await cbf.add("session-xyz")   # counter = 2
+                await cbf.remove("session-xyz") # counter = 1
+                await cbf.exists("session-xyz") # True  (still 1 add outstanding)
+
+        If the item appears to already be present in the filter (all
+        ``k`` buckets are already > 0), a ``WARNING``-level log message
+        is emitted.  This does **not** prevent the add — callers who
+        need strict single-add semantics should gate on ``exists()``
+        before calling ``add()``.
+
         Args:
             item: The string element to insert.
         """
+        offsets = hash_offsets(item, self.k, self.m)
+
+        # Pre-read buckets to detect a probable duplicate
         pipe = self.client.pipeline()
-        for offset in hash_offsets(item, self.k, self.m):
+        for offset in offsets:
+            pipe.hget(self.key, str(offset))
+        values = await pipe.execute()
+
+        if all(v is not None and int(v) > 0 for v in values):
+            logger.warning(
+                "Item %r appears to already exist in CountingBloomFilter(%s). "
+                "Adding again — remember that each add() requires a "
+                "matching remove() before exists() returns False.",
+                item,
+                self.key,
+            )
+
+        pipe = self.client.pipeline()
+        for offset in offsets:
             pipe.hincrby(self.key, str(offset), 1)
         pipe.incr(self._count_key)
         await pipe.execute()
@@ -395,6 +448,12 @@ class CountingBloomFilter:
         bucket has a counter > 0, preventing underflow that would
         corrupt the filter. If any bucket is already 0, the item is
         considered absent and no changes are made.
+
+        .. note::
+
+            If an item was added **N** times, it must be removed **N**
+            times before ``exists()`` returns ``False``. A single
+            ``remove()`` only decrements the counters by 1.
 
         Args:
             item: The string element to remove.
@@ -550,10 +609,18 @@ class ScalableBloomFilter:
     ``growth_factor``) and a tighter error rate (multiplied by ``ratio``)
     so the overall false-positive probability converges to the initial target.
 
+    **TTL behaviour:**
+        When ``set_ttl(seconds)`` is called, the TTL is stored in the
+        metadata hash and applied to **all existing slice keys**.  When
+        the filter auto-scales and creates a new slice, the stored TTL
+        is automatically inherited by the new slice so that all keys
+        expire together. If no TTL has been set, new slices are created
+        without an expiration.
+
     Redis Keys Used:
         - ``{key}:N``        — Bitmap for slice N.
         - ``{key}:N:count``  — Counter for slice N.
-        - ``{key}:meta``     — Hash storing ``num_slices``.
+        - ``{key}:meta``     — Hash storing ``num_slices`` and ``ttl``.
 
     Args:
         client: An async ``redis.asyncio.Redis`` or Valkey client instance.
@@ -616,15 +683,57 @@ class ScalableBloomFilter:
         cap, err = self._slice_params(index)
         return BloomFilter(self.client, f"{self.key}:{index}", cap, err)
 
-    async def _active_slice(self) -> tuple[BloomFilter, int]:
+    async def _get_stored_ttl(self) -> Optional[int]:
+        """
+        Read the TTL value stored in the metadata hash.
+
+        Returns:
+            The stored TTL in seconds, or ``None`` if no TTL has been set.
+        """
+        val = await self.client.hget(self._meta_key, "ttl")
+        return int(val) if val else None
+
+    async def _apply_ttl_to_slice(self, bf: BloomFilter, ttl: Optional[int]) -> None:
+        """
+        Apply a TTL to a slice's bitmap and counter keys.
+
+        Args:
+            bf: The ``BloomFilter`` slice to expire.
+            ttl: Seconds until expiry. If ``None``, no TTL is applied.
+        """
+        if ttl is not None and ttl > 0:
+            pipe = self.client.pipeline()
+            pipe.expire(bf.key, ttl)
+            pipe.expire(bf._count_key, ttl)
+            await pipe.execute()
+
+    async def _active_slice(self) -> tuple[BloomFilter, int, Optional[int]]:
         """
         Return the current active (latest) slice, creating a new one
         if none exist or if the current slice has reached capacity.
+
+        When a new slice is created, it automatically inherits the TTL
+        that was previously set via ``set_ttl()``.  The inherited TTL
+        is the **remaining** TTL of the metadata key (not the original
+        value), so all keys expire at roughly the same wall-clock time.
+
+        Returns:
+            A 3-tuple of ``(bloom_filter, slice_index, pending_ttl)``.
+            ``pending_ttl`` is the TTL in seconds to apply to the new
+            slice **after** data has been written to it, or ``None`` if
+            no TTL should be applied.
         """
         num = await self._get_num_slices()
         if num == 0:
             await self._set_num_slices(1)
-            return self._slice_filter(0), 0
+            bf = self._slice_filter(0)
+            # Compute pending TTL for the very first slice
+            stored_ttl = await self._get_stored_ttl()
+            pending_ttl: Optional[int] = None
+            if stored_ttl is not None:
+                remaining = await self.client.ttl(self._meta_key)
+                pending_ttl = remaining if remaining > 0 else stored_ttl
+            return bf, 0, pending_ttl
         idx = num - 1
         bf = self._slice_filter(idx)
         cnt = await bf.count
@@ -632,12 +741,27 @@ class ScalableBloomFilter:
             idx = num
             await self._set_num_slices(num + 1)
             bf = self._slice_filter(idx)
-        return bf, idx
+            # Compute pending TTL for the newly created slice.
+            stored_ttl = await self._get_stored_ttl()
+            pending_ttl = None
+            if stored_ttl is not None:
+                remaining = await self.client.ttl(self._meta_key)
+                pending_ttl = remaining if remaining > 0 else stored_ttl
+                logger.info(
+                    "ScalableBloomFilter(%s) created slice %d — "
+                    "inherited TTL of %d seconds from parent.",
+                    self.key, idx, pending_ttl,
+                )
+            return bf, idx, pending_ttl
+        return bf, idx, None
 
     async def add(self, item: str) -> None:
         """Add an item, auto-creating a new slice if the current one is full."""
-        bf, _ = await self._active_slice()
+        bf, _, pending_ttl = await self._active_slice()
         await bf.add(item)
+        # Apply TTL *after* writing so that EXPIRE targets an existing key.
+        if pending_ttl is not None:
+            await self._apply_ttl_to_slice(bf, pending_ttl)
 
     async def exists(self, item: str) -> bool:
         """Check all slices — returns True if any slice reports membership."""
@@ -720,9 +844,22 @@ class ScalableBloomFilter:
         await pipe.execute()
 
     async def set_ttl(self, seconds: int) -> None:
-        """Set a TTL on all slice keys, counters, and metadata."""
+        """
+        Set a TTL on all existing slice keys, counters, and metadata.
+
+        The TTL value is also persisted in the metadata hash so that
+        **future slices** created by auto-scaling will automatically
+        inherit the remaining TTL at creation time.  This ensures all
+        keys — including those that don't exist yet — expire at
+        roughly the same wall-clock time.
+
+        Args:
+            seconds: Number of seconds until all keys expire.
+        """
         num = await self._get_num_slices()
         pipe = self.client.pipeline()
+        # Persist the TTL value for future slice inheritance
+        pipe.hset(self._meta_key, "ttl", str(seconds))
         for i in range(num):
             bf = self._slice_filter(i)
             pipe.expire(bf.key, seconds)
