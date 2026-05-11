@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "valbloom"
-version = "1.0.0"
+version = "1.0.1"
 description = "Fast, memory-efficient Bloom Filters backed by Redis / Valkey bitmaps."
 readme = "README.md"
 license = "MIT"

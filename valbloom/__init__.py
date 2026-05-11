@@ -6,7 +6,7 @@ Usage::
     from valbloom import BloomFilter, CountingBloomFilter, ScalableBloomFilter
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 from valbloom.bloom import BloomFilter, CountingBloomFilter, ScalableBloomFilter
 from valbloom.exceptions import ValBloomError, IncompatibleFilterError, CapacityExceededError
